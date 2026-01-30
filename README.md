@@ -5,16 +5,16 @@
 
 ## ✨ 特性
 
-- **🏠 离线优先**: 数据（SQLite）、索引（FAISS）和嵌入模型（BGE-M3）完全运行在本地，无需联网，保障数据隐私。
+- **🏠 离线优先**: 数据（SQLite）、索引（FAISS）和嵌入模型（BGE-M3）完全运行在本地，无需联网。
+- **🔍 混合检索**: 结合 **BGE-M3 语义向量** 与 **SQLite FTS5 关键词** 检索，既懂“意思”又懂“精确条文号”。
 - **🎯 零幻觉**: 强制“检索优先”，回答必须基于检索到的 `<<Source>>` 上下文，拒绝编造。
-- **🧩 智能切片**: 专为法律文档设计的状态机解析器，精准识别“编-章-节-条”层级，保留完整法律逻辑。
-- **🚀 高性能**: 使用 FAISS 向量索引，支持毫秒级检索；基于 BGE-M3 模型提供高质量语义理解。
-- **🔄 增量更新**: 智能追踪文件哈希，仅处理变更文件，极大降低维护成本。
+- **🧩 智能切片**: 专为法律文档设计的状态机解析器，精准识别“编-章-节-条”层级。
+- **🔄 自动维护**: 提供 `loop_build.sh` 守护脚本，支持断点续传、内存防泄漏和增量同步。
 
 ## 🛠️ 环境要求
 
 - Python 3.10+
-- 操作系统: macOS / Linux (Windows 未经完整测试)
+- 操作系统: macOS (Apple Silicon 优化) / Linux
 
 ## 📦 安装与配置
 
@@ -31,37 +31,32 @@
 
 3.  **准备数据**
     将您的 Markdown 格式法律文档放入 `md_vault/` 目录中。
-    > 示例结构：
-    > `md_vault/民商法/中华人民共和国民法典.md`
 
 ## 🚀 使用指南
 
 ### 1. 构建知识库 (Build Index)
 
-首次运行或更新文档后，需要构建向量索引：
+推荐使用守护脚本启动构建，它会自动处理内存释放和增量更新：
 
 ```bash
-# 默认扫描 md_vault 目录
-PYTHONPATH=. python3 src/builder.py
-
-# 或者指定其他目录
-PYTHONPATH=. python3 src/builder.py path/to/your/docs
+chmod +x loop_build.sh
+./loop_build.sh
 ```
 
-该过程会：
-1. 解析 Markdown 文件。
-2. 生成文本切片并存入 SQLite (`data/knowledge.db`)。
-3. 计算向量并构建 FAISS 索引 (`data/vector.index`)。
+该脚本会：
+1. 自动扫描 `md_vault` 变更（增/删/改）。
+2. 在后台分批计算向量（支持断点续传）。
+3. 自动构建 FAISS 向量索引与 FTS5 全文索引。
 
 ### 2. 测试检索 (Retrieve)
 
-验证检索效果，查找最相关的法律条款：
+验证混合检索效果（向量+关键词并行召回）：
 
 ```bash
-PYTHONPATH=. python3 src/retrieve.py "非法集资的定义"
+PYTHONPATH=. python3 src/retrieve.py "醉酒驾车撞人怎么判"
 ```
 
-系统将返回 Top-5 相关切片及其原始出处。
+系统将返回 Top-20 加权排序后的相关切片。
 
 ### 3. 集成 AI 助手 (Agent)
 

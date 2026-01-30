@@ -1,28 +1,35 @@
 import os
-# 关键修复：在导入任何科学计算库之前，强制禁用所有并行化
+# 关键优化：彻底禁用所有底层并行库，防止 macOS 上的 Segmentation Fault
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-# 解决 macOS 特有的 OpenMP 冲突
+
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import hashlib
 import sys
 import gc
-import glob
 import shutil
 import numpy as np
 import sqlite3
 import faiss
+import time
+import torch # 导入以清理显存
 from src.parser import LegalDocParser
 from src.embedding import EmbeddingEngine
 from src.db_manager import DBManager
 
-# 配置
-BATCH_SIZE = 64         # 降低 Batch Size 以进一步减少内存压力
+import argparse
+
+# 默认配置
+DEFAULT_FETCH = 64
+DEFAULT_BATCH = 8
+FETCH_SIZE = DEFAULT_FETCH
+COMPUTE_BATCH = DEFAULT_BATCH
 TEMP_INDEX_DIR = "data/temp_indices"
 
 def get_file_hash(filepath):
@@ -32,138 +39,179 @@ def get_file_hash(filepath):
         hasher.update(buf)
     return hasher.hexdigest()
 
-def build_vectors_stream(db_manager, engine):
+def build_vectors_incremental(db_manager, engine):
     """
-    流式构建向量：
-    1. 从 DB 分页读文本
-    2. 计算向量
-    3. 写入临时 numpy 文件
-    4. 最后构建 FAISS
+    增量构建向量：
+    1. 启动时一次性查出所有缺失向量的 ID 列表。
+    2. 遍历 ID 列表，分批获取文本并计算。
     """
-    os.makedirs(TEMP_INDEX_DIR, exist_ok=True)
-    vec_file = os.path.join(TEMP_INDEX_DIR, "vectors.npy")
-    id_file = os.path.join(TEMP_INDEX_DIR, "ids.npy")
+    missing_ids = db_manager.get_missing_embedding_ids()
+    total_missing = len(missing_ids)
     
-    conn = sqlite3.connect(db_manager.db_path)
-    total_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-    print(f"总数据量: {total_count}")
-    
-    if total_count == 0:
+    if total_missing == 0:
+        print("所有切片均已有向量，跳过计算步骤。")
         return
 
-    # 准备 memmap 文件 (磁盘映射内存)
-    fp_vec = np.memmap(vec_file, dtype='float32', mode='w+', shape=(total_count, 1024))
-    fp_ids = np.memmap(id_file, dtype='int64', mode='w+', shape=(total_count,))
+    print(f"发现 {total_missing} 条数据缺少向量，开始增量计算...")
+    print(f"配置: 拉取批次={FETCH_SIZE} | 计算批次={COMPUTE_BATCH} | 设备={engine.model.device}")
     
-    cursor = conn.execute("SELECT id, content FROM chunks")
-    
+    start_time = time.time()
     processed = 0
-    while True:
-        rows = cursor.fetchmany(BATCH_SIZE)
-        if not rows:
+    
+    # 将 missing_ids 分成固定大小的批次
+    for i in range(0, total_missing, FETCH_SIZE):
+        # 检查是否达到本次运行的上限
+        if MAX_LIMIT > 0 and processed >= MAX_LIMIT:
+            print(f"\n[Info] 已达到本次运行上限 ({MAX_LIMIT} 条)，准备退出并触发重启...")
             break
-            
+
+        batch_ids = missing_ids[i:i + FETCH_SIZE]
+        
+        # 1. 批量获取文本内容
+        rows = db_manager.get_chunks_by_ids(batch_ids)
+        if not rows: continue
+        
         ids = [r[0] for r in rows]
         texts = [r[1] for r in rows]
         
-        # 计算向量
-        embeddings = engine.embed_documents(texts, batch_size=len(texts), show_progress=False)
+        # 2. 计算向量
+        try:
+            embeddings = engine.embed_documents(texts, batch_size=COMPUTE_BATCH, show_progress=False)
+        except Exception as e:
+            if "MPS backend out of memory" in str(e) or "Invalid buffer size" in str(e):
+                print(f"\n[Warning] 显存压力过大，强制清理并降级批次...")
+                torch.mps.empty_cache()
+                gc.collect()
+                embeddings = engine.embed_documents(texts, batch_size=1, show_progress=False)
+            else:
+                raise e
         
-        # 写入 memmap
-        end = processed + len(rows)
-        fp_vec[processed:end] = embeddings
-        fp_ids[processed:end] = ids
+        # 3. 回写数据库
+        updates = []
+        for cid, emb in zip(ids, embeddings):
+            updates.append((cid, emb.astype('float32').tobytes()))
+        db_manager.update_chunk_embeddings(updates)
         
-        processed = end
+        # 4. 进度与资源管理
+        processed += len(rows)
+        elapsed = time.time() - start_time
+        speed = processed / elapsed if elapsed > 0 else 0
+        eta = (total_missing - processed) / speed / 60 if speed > 0 else 0
         
-        # 强制刷盘 & GC
-        if processed % 1000 < BATCH_SIZE:
-            fp_vec.flush()
-            fp_ids.flush()
+        print(f"[计算中] 进度: {processed}/{total_missing} ({(processed/total_missing):.1%}) | 速度: {speed:.1f} docs/s | ETA: {eta:.1f} min", end="\r")
+        sys.stdout.flush()
+        
+        # 彻底释放当前批次内存
+        del texts, embeddings, updates, rows, ids, batch_ids
+        if processed % 128 == 0:
             gc.collect()
-            print(f"进度: {processed}/{total_count} ({(processed/total_count)*100:.1f}%)")
-            sys.stdout.flush()
-            
-    conn.close()
-    fp_vec.flush()
-    fp_ids.flush()
-    print("向量计算完成，开始构建最终索引...")
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+
+    print(f"\n向量计算阶段完成！耗时: {(time.time()-start_time)/60:.1f} 分钟")
+
+def rebuild_faiss_index(db_manager):
+    """
+    从数据库加载所有向量并重建 Faiss 索引。
+    """
+    print("正在从数据库加载向量以构建索引...")
+    ids, vectors = db_manager.get_all_vectors()
     
-    # 构建索引
-    # 此时我们只需要读 memmap
+    if len(ids) == 0:
+        print("没有向量数据，无法构建索引。")
+        return
+
+    print(f"加载完成，共 {len(ids)} 条。开始构建 Faiss 索引...")
     index = faiss.IndexFlatIP(1024)
     index = faiss.IndexIDMap(index)
     
-    # 批量添加 (FAISS 添加也是分块的，不会一次性读入)
-    CHUNK_SIZE = 10000
-    for i in range(0, total_count, CHUNK_SIZE):
-        end = min(i + CHUNK_SIZE, total_count)
-        # 读入一小块 RAM
-        v_chunk = np.array(fp_vec[i:end]) 
-        i_chunk = np.array(fp_ids[i:end])
-        index.add_with_ids(v_chunk, i_chunk)
-        print(f"索引构建: {end}/{total_count}")
-        sys.stdout.flush()
-        
+    index.add_with_ids(vectors, np.array(ids).astype('int64'))
+    
     db_manager.index = index
     db_manager.save_index()
-    
-    # 清理临时文件
-    try:
-        shutil.rmtree(TEMP_INDEX_DIR)
-    except:
-        pass
-        
-    print("全部完成！")
+    print("索引构建并保存完成。")
 
 def build_pipeline(data_dir: str, db_manager: DBManager, engine: EmbeddingEngine):
     parser = LegalDocParser()
-    
     print(f"扫描目录: {data_dir}...")
     files_processed = 0
+    ignored_dirs = ["temp_indices", ".git"]
     
-    # 1. 扫描文件并入库 (不计算向量，只存文本)
+    pending_files = []
     for root, dirs, files in os.walk(data_dir):
+        if any(ignored in root for ignored in ignored_dirs): continue
         for file in files:
-            if not file.endswith('.md'): continue
-            filepath = os.path.join(root, file)
-            rel_path = os.path.relpath(filepath, data_dir)
-            file_hash = get_file_hash(filepath)
-            
-            existing = db_manager.get_file_by_path(rel_path)
-            if existing and existing['file_hash'] == file_hash:
-                continue
-            
-            # 解析并入库
-            if files_processed % 100 == 0:
-                print(f"解析中... 已处理 {files_processed} 新文件")
-                sys.stdout.flush()
+            if file.endswith('.md'):
+                pending_files.append(os.path.join(root, file))
                 
-            db_manager.delete_file_chunks(existing['id'] if existing else -1)
-            title = os.path.basename(filepath).replace('.md', '')
-            file_id = db_manager.add_file(rel_path, file_hash, title)
-            chunks = parser.parse(filepath)
-            if chunks:
-                db_manager.insert_chunks(file_id, chunks)
-            files_processed += 1
+    print(f"找到 {len(pending_files)} 个 Markdown 文件。正在同步数据库文本...")
 
-    print(f"新文件解析完成。开始检查索引状态...")
+    # --- 补齐：清理已从磁盘删除的文件 ---
+    all_db_files = db_manager.get_all_files() # 需要在 db_manager 中添加此方法
+    disk_rel_paths = {os.path.relpath(p, data_dir) for p in pending_files}
     
-    # 2. 检查索引
-    # 如果是增量更新，我们这里采用了简单的策略：只要有更新，就全量重构索引。
-    # 对于 10万 级别数据，全量重构比维护增量索引更稳健。
-    if files_processed > 0 or db_manager.index is None or db_manager.index.ntotal == 0:
-        build_vectors_stream(db_manager, engine)
-    else:
-        print("索引已是最新。")
+    deleted_count = 0
+    for db_file in all_db_files:
+        if db_file['filepath'] not in disk_rel_paths:
+            print(f"清理已删除文件: {db_file['filepath']}")
+            db_manager.delete_file_and_chunks(db_file['id']) # 需要添加此方法
+            deleted_count += 1
+    if deleted_count > 0:
+        print(f"已清理 {deleted_count} 个失效文件记录。")
+    # -----------------------------------
+
+    for filepath in pending_files:
+        rel_path = os.path.relpath(filepath, data_dir)
+        file_hash = get_file_hash(filepath)
+        
+        existing = db_manager.get_file_by_path(rel_path)
+        if existing and existing['file_hash'] == file_hash:
+            continue
+        
+        # 如果文件变更，先删除旧数据的 chunks (级联删除会导致向量也丢失，符合逻辑)
+        if existing:
+            db_manager.delete_file_chunks(existing['id'])
+            
+        title = os.path.basename(filepath).replace('.md', '')
+        file_id = db_manager.add_file(rel_path, file_hash, title)
+        chunks = parser.parse(filepath)
+        
+        if chunks:
+            # 插入 chunks 时，embedding 列默认为 NULL
+            db_manager.insert_chunks(file_id, chunks)
+            files_processed += 1
+            
+        if files_processed % 100 == 0:
+            print(f"已处理 {files_processed} 个变更文件...")
+
+    print("数据库文本同步完成。")
+    
+    # 阶段一：补全缺失的向量
+    build_vectors_incremental(db_manager, engine)
+    
+    # 阶段二：总是重建索引，确保数据一致性
+    rebuild_faiss_index(db_manager)
 
 if __name__ == "__main__":
-    data_dir = "md_vault"
-    if len(sys.argv) > 1:
-        data_dir = sys.argv[1]
+    parser = argparse.ArgumentParser(description="Build knowledge graph index")
+    parser.add_argument("data_dir", nargs='?', default="md_vault", help="Path to markdown data")
+    parser.add_argument("--fetch_size", type=int, default=DEFAULT_FETCH, help="SQL fetch batch size")
+    parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH, help="Embedding compute batch size")
+    parser.add_argument("--device", type=str, default="mps", choices=["mps", "cpu"], help="Device to use (mps or cpu)")
+    parser.add_argument("--limit", type=int, default=0, help="Max items to process before exiting (0 for no limit)")
+    
+    args = parser.parse_args()
+    
+    # Update globals
+    FETCH_SIZE = args.fetch_size
+    COMPUTE_BATCH = args.batch_size
+    MAX_LIMIT = args.limit
+    data_dir = args.data_dir
 
     db = DBManager()
-    # 强制 CPU 并开启低内存模式
-    engine = EmbeddingEngine(device="cpu") 
-    
+
+    # 根据参数选择设备
+    print(f"初始化模型，使用设备: {args.device}")
+    engine = EmbeddingEngine(device=args.device) 
+
     build_pipeline(data_dir, db, engine)

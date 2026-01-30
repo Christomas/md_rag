@@ -94,17 +94,29 @@
 ### 2.2 增量更新策略 (Incremental Updates)
 
 *   **状态追踪**: SQLite `file_registry` 表记录 `{filepath, file_hash, last_updated}`。
+*   **构建模式**: 采用 `loop_build.sh` 守护进程模式，每处理 N 条数据自动重启，彻底解决 Python/MPS 内存泄漏问题。
 *   **流程**:
-    1.  **Scan**: 遍历磁盘文件，计算 Hash。
-    2.  **Diff**:
-        *   `New`: 磁盘有，DB 无 -> **Process**。
-        *   `Modified`: 磁盘 Hash != DB Hash -> **Delete Old Chunks** -> **Process**。
-        *   `Deleted`: DB 有，磁盘无 -> **Delete Chunks**。
-    3.  **Process**: 运行 `LegalDocParser` -> `BGE-M3 Embedding` -> 写入 SQLite。
-    4.  **Rebuild**:
-        *   SQLite 更新完毕后，查询所有有效 chunks 的向量。
-        *   **全量重建** FAISS 索引 (2.5万向量重建仅需秒级，比动态维护更稳健)。
-        *   保存 `vector.index`。
+    1.  **Scan**: 遍历磁盘，对比 Hash，标记 New/Modified/Deleted。
+    2.  **Clean**: 物理删除失效文件的 chunks 和向量。
+    3.  **Process**: 解析新文件 -> 存入 SQLite。
+    4.  **Vectorize**: 增量计算缺失的 `embedding` (支持断点续传)。
+    5.  **Rebuild**: 全量重建 FAISS 索引和 FTS 全文索引。
+
+### 2.3 混合检索策略 (Hybrid Retrieval) —— [已实装]
+
+为解决法律场景下“语义模糊”与“精确条文”的矛盾，采用双路召回机制。
+
+1.  **Path A: 语义召回 (Semantic)**
+    *   工具: `BGE-M3` + `FAISS`
+    *   目标: 召回 Top-30。解决“意思对但词不对”的问题（如搜“杀人”召回“故意杀人罪”）。
+2.  **Path B: 关键词召回 (Lexical)**
+    *   工具: `SQLite FTS5` (BM25)
+    *   目标: 召回 Top-30。解决“精确法条号”或“特定术语”的问题（如搜“刑法第二十条”）。
+3.  **Merge: 互惠秩融合 (RRF)**
+    *   算法: $Score = \sum \frac{1}{60 + Rank_i}$
+    *   效果: 即使某条结果仅在单路中出现（如仅关键词命中），也能获得足够高的排名。
+4.  **Rerank: 业务加权**
+    *   对 `A核心条文` (1.5x) 等目录进行加权，输出最终 Top-20。
 
 ---
 
@@ -126,9 +138,14 @@
 | :--- | :--- | :--- |
 | `id` | INTEGER PK | 对应 FAISS ID |
 | `file_id` | INTEGER FK | |
-| `content` | TEXT | 切片纯文本 (用于展示) |
+| `content` | TEXT | 切片纯文本 |
 | `meta_info` | TEXT | JSON: {path: "...", source: "..."} |
-| `embedding` | BLOB | (可选) 向量备份 |
+| `embedding` | BLOB | **核心**: 1024维 float32 向量 |
+
+**Virtual Table: `chunks_fts`** (全文索引)
+*   **Type**: FTS5 Virtual Table
+*   **Content**: 镜像 `chunks.content`
+*   **Triggers**: 自动随 `chunks` 表增删改同步。
 
 ### 3.2 FAISS (`vector.index`)
 *   **类型**: `IndexFlatIP` (内积/余弦相似度) 或 `IndexHNSW` (大规模时用)。
@@ -174,3 +191,21 @@
 ### Phase 3: 优化 (Refinement)
 1.  **Prompt Engineering**: 优化 Gemini 的 System Prompt，确保严格引用格式。
 2.  **UI**: (可选) 封装简单的 CLI 交互界面。
+
+---
+
+## 6. Pending Optimizations (Next Steps)
+
+### 6.1 智能重排与生成 (LLM Reranking & Synthesis)
+*   **Strategy**:
+    *   输入 Top-20 条文 (约 30k-40k Token)。
+    *   Gemini 识别法条冲突、适用层级及核心要点。
+    *   输出：结构化法律建议 + 精确引用。
+
+### 6.2 动态裁剪 (Sub-chunk Cropping) - Optional
+针对大粒度切片 (1000+ 字符) 造成的 Token 浪费问题，考虑在检索后进行动态视窗裁剪。
+
+*   **Logic**:
+    *   在命中 Chunk 中定位关键词/语义中心。
+    *   截取中心前后 N 行作为 "Snippet"。
+*   **Risk**: 可能会丢失“例外条款”或上下文约束 (断章取义)。需谨慎评估法律风险后再实施。
